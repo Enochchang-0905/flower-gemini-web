@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>花藝助手 AI - 智慧記帳</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script type="importmap">
+        {
+            "imports": {
+                "react": "https://esm.sh/react@18.2.0",
+                "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+                "lucide-react": "https://esm.sh/lucide-react@0.330.0"
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        /* 解決 iOS 輸入框字體放大問題 */
+        input, textarea {
+            font-size: 16px !important; 
+        }
+        /* 隱藏 Scrollbar 但保留功能 */
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .no-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { 
+            Plus, Save, Trash2, ArrowLeft, FileText, Calculator, Loader2, Edit3, 
+            Calendar, Truck, User, List, Tag, Search, Type, MessageSquare, 
+            StickyNote, AlertCircle, CheckCircle, Leaf, Sparkles, ScanLine, 
+            Settings, ExternalLink, Info, HelpCircle, ChevronRight 
+        } from 'lucide-react';
+
+        // -----------------------------------------------------------------------------
+        // Utilities & Parsing Logic
+        // -----------------------------------------------------------------------------
+
+        const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+        // 預設花材清單
+        const DEFAULT_INVENTORY = [
+            { id: 'def1', name: '龜背芋', price: 150, aliases: '電信,電信葉' },
+            { id: 'def2', name: '山胡椒', price: 100, aliases: '馬告' },
+            { id: 'def3', name: '紫檀', price: 200, aliases: '' },
+            { id: 'def4', name: '葉蘭', price: 150, aliases: '' },
+            { id: 'def5', name: '繡線', price: 150, aliases: '' },
+            { id: 'def6', name: '茶花葉', price: 120, aliases: '' },
+            { id: 'def7', name: '黃藍柏', price: 180, aliases: '' },
+            { id: 'def8', name: '黃金百合竹', price: 160, aliases: '百合竹' },
+            { id: 'def9', name: '娃娃竹', price: 150, aliases: '' },
+            { id: 'def10', name: '紅邊白竹', price: 150, aliases: '' },
+            { id: 'def11', name: '黃揚木', price: 130, aliases: '' },
+            { id: 'def12', name: '木麻黃', price: 100, aliases: '' },
+            { id: 'def13', name: '波浪火鶴葉', price: 250, aliases: '火鶴葉' },
+        ];
+
+        // -----------------------------------------------------------------------------
+        // Gemini API Integration
+        // -----------------------------------------------------------------------------
+
+        const callGeminiAPI = async (userApiKey, prompt, imageBase64 = null) => {
+            const apiKey = userApiKey || ""; 
+            const model = "gemini-2.5-flash"; 
+            
+            if (!apiKey) {
+                throw new Error('請先至設定頁面輸入您的 Google Gemini API Key');
+            }
+
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+            const contents = [
+                {
+                    parts: [
+                        { text: prompt },
+                        ...(imageBase64 ? [{
+                            inlineData: {
+                                mimeType: "image/jpeg",
+                                data: imageBase64.split(',')[1]
+                            }
+                        }] : [])
+                    ]
+                }
+            ];
+
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents,
+                        generationConfig: {
+                            responseMimeType: "application/json",
+                            temperature: 0.2,
+                        }
+                    })
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json();
+                    if (response.status === 400 && errData.error?.message?.includes('API key')) {
+                        throw new Error('API Key 無效或權限不足。');
+                    }
+                    throw new Error(errData.error?.message || 'API request failed');
+                }
+
+                const data = await response.json();
+                const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                return JSON.parse(textResult);
+
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                throw error;
+            }
+        };
+
+        const GEMINI_SYSTEM_PROMPT = `
+        You are a professional florist assistant. 
+        Analyze the provided receipt (image or text) and extract the structured order details.
+        Return ONLY a valid JSON object with the following structure:
+        {
+        "customerName": "string (extract from header or first line, e.g., 森林)",
+        "date": "string (YYYY-MM-DD, use today if missing)",
+        "deliveryDate": "string (YYYY-MM-DD, use today if missing)",
+        "notes": "string (any delivery instructions or context that is not a product)",
+        "items": [
+            {
+            "name": "string (flower name, clean up numbering like 1.)",
+            "quantity": number,
+            "unitPrice": number (0 if unknown),
+            "amount": number (total for this line, 0 if unknown),
+            "note": "string (specifications like 大1 小1, color, or size)"
+            }
+        ],
+        "totalAmount": number (sum of all amounts, or 0)
+        }
+        Identify flower names and quantities intelligently. 
+        For input like "波浪火鶴葉 大1 小1", quantity is 2, note is "大1 小1".
+        Ignore text like "謝謝", "-葉材-" as items, but use context for notes.
+        Translate traditional chinese if needed to understand, but output chinese.
+        `;
+
+        // -----------------------------------------------------------------------------
+        // Components
+        // -----------------------------------------------------------------------------
+
+        function App() {
+            const [view, setView] = useState('list');
+            const [bills, setBills] = useState([]);
+            const [inventory, setInventory] = useState([]); 
+            const [currentBill, setCurrentBill] = useState(null);
+            const [billToDeleteId, setBillToDeleteId] = useState(null);
+            const [layoutMode, setLayoutMode] = useState('mobile');
+            const [notification, setNotification] = useState(null);
+            const [userApiKey, setUserApiKey] = useState('');
+
+            // Init Data
+            useEffect(() => {
+                const savedBills = localStorage.getItem('smart_receipt_bills_v3');
+                if (savedBills) setBills(JSON.parse(savedBills));
+                
+                const savedInventory = localStorage.getItem('smart_receipt_inventory_v3');
+                if (savedInventory) {
+                    setInventory(JSON.parse(savedInventory));
+                } else {
+                    setInventory(DEFAULT_INVENTORY);
+                    localStorage.setItem('smart_receipt_inventory_v3', JSON.stringify(DEFAULT_INVENTORY));
+                }
+                
+                // Load API Key
+                const savedKey = localStorage.getItem('smart_receipt_api_key');
+                if (savedKey) setUserApiKey(savedKey);
+                
+                // First time user? Maybe show help? (Optional)
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem('smart_receipt_bills_v3', JSON.stringify(bills));
+            }, [bills]);
+
+            useEffect(() => {
+                localStorage.setItem('smart_receipt_inventory_v3', JSON.stringify(inventory));
+            }, [inventory]);
+
+            const saveApiKey = (key) => {
+                setUserApiKey(key);
+                localStorage.setItem('smart_receipt_api_key', key);
+            };
+
+            useEffect(() => {
+                if (notification) {
+                    const timer = setTimeout(() => setNotification(null), 3000);
+                    return () => clearTimeout(timer);
+                }
+            }, [notification]);
+
+            const findPrice = (queryName, inv = inventory) => {
+                if (!queryName) return 0;
+                const cleanQuery = queryName.trim().toLowerCase();
+                const found = inv.find(item => {
+                    if (item.name.toLowerCase() === cleanQuery) return true;
+                    if (item.aliases) {
+                        const aliasArray = Array.isArray(item.aliases) ? item.aliases : item.aliases.split(/[,，]/);
+                        return aliasArray.some(alias => alias.trim().toLowerCase() === cleanQuery);
+                    }
+                    return false;
+                });
+                return found ? found.price : 0;
+            };
+
+            const updateInventoryPriceAndSyncBills = (itemId, newPrice) => {
+                const price = parseFloat(newPrice) || 0;
+                let targetItemName = '';
+                let targetAliases = [];
+                const newInventory = inventory.map(item => {
+                    if (item.id === itemId) {
+                        targetItemName = item.name;
+                        targetAliases = item.aliases ? (Array.isArray(item.aliases) ? item.aliases : item.aliases.split(/[,，]/)) : [];
+                        return { ...item, price };
+                    }
+                    return item;
+                });
+                setInventory(newInventory);
+                let updatedBillCount = 0;
+                const newBills = bills.map(bill => {
+                    let isBillUpdated = false;
+                    const newItems = bill.items.map(billItem => {
+                        const isMatch = 
+                            billItem.name.trim().toLowerCase() === targetItemName.toLowerCase() ||
+                            targetAliases.some(a => a.trim().toLowerCase() === billItem.name.trim().toLowerCase());
+                        if (isMatch) {
+                            if (billItem.unitPrice !== price) {
+                                isBillUpdated = true;
+                                return { ...billItem, unitPrice: price, amount: billItem.quantity * price };
+                            }
+                        }
+                        return billItem;
+                    });
+                    if (isBillUpdated) {
+                        updatedBillCount++;
+                        const newTotal = newItems.reduce((sum, item) => sum + item.amount, 0);
+                        return { ...bill, items: newItems, totalAmount: newTotal };
+                    }
+                    return bill;
+                });
+                if (updatedBillCount > 0) {
+                    setBills(newBills);
+                    setNotification({ type: 'success', message: `已更新花材「${targetItemName}」價格，同步修正了 ${updatedBillCount} 筆帳單！` });
+                }
+            };
+
+            const handleSaveBill = (bill) => {
+                const existingIndex = bills.findIndex(b => b.id === bill.id);
+                if (existingIndex >= 0) {
+                    const newBills = [...bills];
+                    newBills[existingIndex] = bill;
+                    setBills(newBills);
+                } else {
+                    setBills([bill, ...bills]);
+                }
+                const newInventory = [...inventory];
+                let hasNewItems = false;
+                bill.items.forEach(billItem => {
+                    const price = findPrice(billItem.name, newInventory);
+                    const exists = newInventory.some(inv => {
+                        const aliases = Array.isArray(inv.aliases) ? inv.aliases : inv.aliases.split(/[,，]/);
+                        return inv.name === billItem.name || aliases.includes(billItem.name);
+                    });
+                    if (!exists && billItem.name.trim() !== '') {
+                        newInventory.push({
+                            id: generateId(),
+                            name: billItem.name,
+                            price: parseFloat(billItem.unitPrice) || 0,
+                            aliases: ''
+                        });
+                        hasNewItems = true;
+                    }
+                });
+                if (hasNewItems) setInventory(newInventory);
+                setView('list');
+            };
+
+            const startNewBill = () => {
+                setCurrentBill({
+                    id: generateId(),
+                    date: new Date().toISOString().split('T')[0],
+                    deliveryDate: new Date().toISOString().split('T')[0],
+                    customerName: '',
+                    notes: '',
+                    items: [],
+                    totalAmount: 0,
+                    rawText: ''
+                });
+                setView('upload');
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-50 text-gray-800 font-sans pb-20">
+                    {notification && (
+                        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-top-2 w-[90%] max-w-sm">
+                            <div className="bg-gray-800 text-white px-4 py-3 rounded-xl shadow-xl flex items-center gap-3">
+                                <CheckCircle className="text-emerald-400 shrink-0" size={20} />
+                                <span className="text-sm font-medium">{notification.message}</span>
+                            </div>
+                        </div>
+                    )}
+                    <header className="bg-emerald-600 text-white sticky top-0 z-20 shadow-md transition-colors">
+                        <div className="max-w-md mx-auto px-4 h-14 flex items-center justify-between">
+                            <div className="flex items-center gap-2 font-bold text-lg cursor-pointer" onClick={() => setView('list')}>
+                                <Leaf size={20} /> 花藝助手
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <nav className="flex items-center gap-1 mr-2">
+                                    <button onClick={() => setView('list')} className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors flex items-center gap-1 ${view === 'list' ? 'bg-white text-emerald-600' : 'text-emerald-100 hover:bg-emerald-500'}`}><List size={14} /> 帳本</button>
+                                    <button onClick={() => setView('prices')} className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors flex items-center gap-1 ${view === 'prices' ? 'bg-white text-emerald-600' : 'text-emerald-100 hover:bg-emerald-500'}`}><Tag size={14} /> 單價</button>
+                                    <button onClick={() => setLayoutMode(prev => prev === 'mobile' ? 'desktop' : 'mobile')} className="px-3 py-1.5 rounded-full text-xs font-medium transition-colors text-emerald-100 hover:bg-emerald-500 hidden sm:block">{layoutMode === 'mobile' ? '寬版' : '窄版'}</button>
+                                </nav>
+                                <button onClick={() => setView('settings')} className={`p-2 rounded-full transition-colors ${view === 'settings' ? 'bg-emerald-700 text-white' : 'text-emerald-100 hover:bg-emerald-500'}`}>
+                                    <Settings size={20} />
+                                </button>
+                                <button onClick={() => setView('help')} className={`p-2 rounded-full transition-colors ${view === 'help' ? 'bg-emerald-700 text-white' : 'text-emerald-100 hover:bg-emerald-500'}`}>
+                                    <HelpCircle size={20} />
+                                </button>
+                                <button onClick={startNewBill} className={`ml-2 w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center hover:bg-emerald-400 transition-colors shadow-sm text-white`}><Plus size={18} /></button>
+                            </div>
+                        </div>
+                    </header>
+                    <main className={`${layoutMode === 'mobile' ? 'max-w-md' : 'max-w-3xl'} mx-auto p-4`}>
+                        {view === 'list' && (
+                            <ListView bills={bills} onAdd={startNewBill} onEdit={(bill) => { setCurrentBill({...bill}); setView('edit'); }} onDelete={(id) => setBillToDeleteId(id)} billToDeleteId={billToDeleteId} setBillToDeleteId={setBillToDeleteId} confirmDelete={() => { if (billToDeleteId) { setBills(bills.filter(b => b.id !== billToDeleteId)); setBillToDeleteId(null); } }} />
+                        )}
+                        {view === 'prices' && (
+                            <InventoryView inventory={inventory} setInventory={setInventory} onPriceUpdate={updateInventoryPriceAndSyncBills} />
+                        )}
+                        {view === 'settings' && (
+                            <SettingsView apiKey={userApiKey} onSaveKey={saveApiKey} onBack={() => setView('list')} />
+                        )}
+                        {view === 'help' && (
+                            <HelpView onBack={() => setView('list')} />
+                        )}
+                        {view === 'upload' && (
+                            <UploadView 
+                                inventory={inventory}
+                                userApiKey={userApiKey}
+                                onCancel={() => setView('list')}
+                                onParsed={(data, rawText) => {
+                                    const enrichedItems = data.items.map(item => {
+                                        const foundPrice = findPrice(item.name, inventory);
+                                        if (foundPrice > 0 && (item.unitPrice === 0 || !item.unitPrice)) {
+                                            return { ...item, unitPrice: foundPrice, amount: item.quantity * foundPrice };
+                                        }
+                                        return item;
+                                    });
+                                    const finalItems = enrichedItems.map(i => ({ ...i, id: i.id || generateId() }));
+                                    const newTotal = finalItems.reduce((sum, item) => sum + item.amount, 0);
+                                    setCurrentBill(prev => ({ 
+                                        ...prev, ...data, items: finalItems, totalAmount: newTotal > 0 ? newTotal : data.totalAmount, rawText 
+                                    }));
+                                    setView('edit');
+                                }}
+                            />
+                        )}
+                        {view === 'edit' && currentBill && (
+                            <EditView initialData={currentBill} inventory={inventory} onSave={handleSaveBill} onCancel={() => setView('list')} />
+                        )}
+                    </main>
+                </div>
+            );
+        }
+
+        // -----------------------------------------------------------------------------
+        // Sub Components
+        // -----------------------------------------------------------------------------
+
+        const HelpView = ({ onBack }) => {
+            return (
+                <div className="animate-in fade-in duration-300 space-y-6 pb-10">
+                    <div className="flex items-center gap-2 mb-4">
+                        <button onClick={onBack} className="p-2 hover:bg-gray-100 rounded-full"><ArrowLeft size={20} className="text-gray-600" /></button>
+                        <h2 className="text-xl font-bold text-gray-800">使用說明</h2>
+                    </div>
+
+                    {/* 1. 設定 AI */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center font-bold">1</div>
+                            <h3 className="font-bold text-gray-800">初始設定 (啟用 AI)</h3>
+                        </div>
+                        <p className="text-sm text-gray-600 mb-3 leading-relaxed">
+                            為了使用超強的「LINE 文字解析」與「照片辨識」功能，您需要一個 Google Gemini API Key (免費申請)。
+                        </p>
+                        <ul className="text-sm text-gray-600 space-y-2 list-disc list-inside bg-gray-50 p-3 rounded-lg">
+                            <li>點擊右上角的 <Settings size={14} className="inline" /> <strong>設定</strong> 按鈕。</li>
+                            <li>點擊連結前往 Google AI Studio 申請 Key。</li>
+                            <li>將 Key 貼上並儲存即可。</li>
+                        </ul>
+                    </div>
+
+                    {/* 2. 新增帳單 */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center font-bold">2</div>
+                            <h3 className="font-bold text-gray-800">新增帳單</h3>
+                        </div>
+                        <div className="space-y-4">
+                            <div>
+                                <h4 className="font-bold text-sm text-emerald-700 mb-1 flex items-center gap-1"><Type size={14}/> LINE 文字貼上 (推薦)</h4>
+                                <p className="text-sm text-gray-600">直接複製 LINE 的訂單訊息貼上。AI 會自動辨識：</p>
+                                <div className="text-xs text-gray-500 bg-gray-50 p-2 rounded mt-1 font-mono">
+                                    森林 (客戶)<br/>
+                                    幫我送佳芳家 (備註)<br/>
+                                    龜背芋 10把 (品項+數量)<br/>
+                                    波浪火鶴葉 大1 小1 (複雜規格)
+                                </div>
+                            </div>
+                            <div>
+                                <h4 className="font-bold text-sm text-emerald-700 mb-1 flex items-center gap-1"><ScanLine size={14}/> 照片辨識</h4>
+                                <p className="text-sm text-gray-600">直接拍攝手寫單據。適合字跡較工整的單據。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* 3. 單價自動化 */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center font-bold">3</div>
+                            <h3 className="font-bold text-gray-800">單價與自動化</h3>
+                        </div>
+                        <p className="text-sm text-gray-600 mb-2 leading-relaxed">
+                            系統會自動記憶花材價格。您也可以在 <Tag size={12} className="inline"/> <strong>單價表</strong> 中手動管理。
+                        </p>
+                         <div className="bg-orange-50 border border-orange-100 p-3 rounded-lg text-xs text-orange-800">
+                            <strong className="block mb-1">✨ 價格連動更新：</strong>
+                            如果您在「單價表」修改了某個花材的價格，系統會自動詢問並幫您把<strong>所有歷史帳單</strong>中的該花材價格一併更新！
+                        </div>
+                    </div>
+
+                    {/* 4. 資料安全 */}
+                    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+                         <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center font-bold">4</div>
+                            <h3 className="font-bold text-gray-800">資料儲存</h3>
+                        </div>
+                        <p className="text-sm text-gray-600">
+                            所有資料（帳單、API Key）都只儲存在<strong>您的瀏覽器</strong>中，不會上傳到任何伺服器。
+                        </p>
+                    </div>
+                </div>
+            );
+        };
+
+        const SettingsView = ({ apiKey, onSaveKey, onBack }) => {
+            const [inputKey, setInputKey] = useState(apiKey);
+            const [showSuccess, setShowSuccess] = useState(false);
+
+            const handleSave = () => {
+                onSaveKey(inputKey.trim());
+                setShowSuccess(true);
+                setTimeout(() => setShowSuccess(false), 2000);
+            };
+
+            return (
+                <div className="animate-in fade-in duration-300 space-y-4">
+                    <div className="flex items-center gap-2 mb-4">
+                        <button onClick={onBack} className="p-2 hover:bg-gray-100 rounded-full"><ArrowLeft size={20} className="text-gray-600" /></button>
+                        <h2 className="text-xl font-bold text-gray-800">設定</h2>
+                    </div>
+
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 space-y-4">
+                        <div className="flex items-center gap-2 text-emerald-700 font-bold pb-2 border-b border-gray-100">
+                            <Settings size={20} /> 
+                            <span>API 金鑰設定</span>
+                        </div>
+                        
+                        <div className="bg-green-50 border border-green-100 p-4 rounded-lg text-sm text-green-800 flex gap-3">
+                            <Info size={20} className="shrink-0 mt-0.5" />
+                            <div>
+                                <p className="font-bold mb-1">關於費用：</p>
+                                <p>Google AI Studio 提供 <span className="font-bold">免費層級 (Free Tier)</span>，每分鐘 15 次請求、每天 1,500 次請求皆為<span className="font-bold text-red-500">免費</span>。對於個人記帳使用綽綽有餘，請放心申請。</p>
+                            </div>
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-xs font-bold text-gray-700">Google Gemini API Key</label>
+                            <input 
+                                type="password" 
+                                value={inputKey}
+                                onChange={e => setInputKey(e.target.value)}
+                                placeholder="AIzaSy..."
+                                className="w-full p-3 border border-gray-200 rounded-lg focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none font-mono text-sm"
+                            />
+                        </div>
+
+                        <div className="flex items-center justify-between pt-2">
+                            <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-xs text-emerald-600 flex items-center gap-1 hover:underline">
+                                <ExternalLink size={12} /> 取得免費 API Key
+                            </a>
+                            <button 
+                                onClick={handleSave}
+                                className="bg-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:bg-emerald-700 transition-colors flex items-center gap-2"
+                            >
+                                {showSuccess ? <CheckCircle size={16} /> : <Save size={16} />}
+                                {showSuccess ? '已儲存' : '儲存設定'}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="bg-blue-50 p-4 rounded-xl text-sm text-blue-800 border border-blue-100">
+                        <p className="font-bold mb-1">隱私權說明：</p>
+                        <p>您的 API Key 僅會儲存在您瀏覽器的 LocalStorage 中，不會傳送給任何第三方伺服器，請安心使用。</p>
+                    </div>
+                </div>
+            );
+        };
+
+        const ListView = ({ bills, onAdd, onEdit, onDelete, billToDeleteId, setBillToDeleteId, confirmDelete }) => {
+            const totalSum = bills.reduce((acc, bill) => acc + (parseFloat(bill.totalAmount) || 0), 0);
+            return (
+                <div className="space-y-4 animate-in fade-in duration-300">
+                    {billToDeleteId && (
+                        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                            <div className="bg-white p-6 rounded-xl shadow-2xl w-full max-w-xs space-y-4">
+                                <h3 className="text-lg font-bold text-red-600">確認刪除</h3>
+                                <p className="text-gray-600">您確定要刪除這筆帳單記錄嗎？</p>
+                                <div className="flex justify-end gap-3">
+                                    <button onClick={() => setBillToDeleteId(null)} className="px-4 py-2 text-gray-600 rounded-lg hover:bg-gray-100">取消</button>
+                                    <button onClick={confirmDelete} className="px-4 py-2 bg-red-600 text-white rounded-lg font-medium hover:bg-red-700 shadow-md">確認刪除</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    <div className="bg-gradient-to-r from-emerald-500 to-teal-600 p-4 rounded-xl shadow-lg text-white flex justify-between items-center">
+                        <div><p className="text-emerald-100 text-xs mb-1">本月累計總額</p><p className="text-3xl font-bold">TWD {totalSum.toLocaleString()}</p></div>
+                        <div className="bg-white/20 p-2 rounded-lg backdrop-blur-sm"><Calculator size={24} /></div>
+                    </div>
+                    {bills.length === 0 ? (
+                        <div className="text-center py-12 text-gray-400"><List size={48} className="mx-auto mb-4 opacity-20" /><p>目前沒有帳單</p></div>
+                    ) : (
+                        <div className="space-y-3">
+                            {bills.map(bill => (
+                                <div key={bill.id} onClick={() => onEdit(bill)} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 active:scale-[0.98] transition-transform cursor-pointer hover:shadow-md">
+                                    <div className="flex justify-between items-start mb-2">
+                                        <div className="font-bold text-gray-800 text-lg line-clamp-1">{bill.customerName || '未填寫客戶'}</div>
+                                        <div className="text-lg font-bold text-emerald-600 whitespace-nowrap ml-2">${(parseFloat(bill.totalAmount) || 0).toLocaleString()}</div>
+                                    </div>
+                                    <div className="flex flex-col gap-1 text-sm text-gray-500">
+                                        <div className="flex items-center gap-2"><Calendar size={14} /> <span>帳單: {bill.date}</span></div>
+                                        {bill.notes && <div className="flex items-center gap-2 text-gray-400"><StickyNote size={12} /><span className="text-xs truncate max-w-[200px]">{bill.notes}</span></div>}
+                                        <div className="mt-2 pt-2 border-t border-gray-100 flex justify-between items-center">
+                                            <span className="text-xs bg-gray-100 px-2 py-1 rounded text-gray-600">{bill.items.length} 品項</span>
+                                            <button onClick={(e) => { e.stopPropagation(); onDelete(bill.id); }} className="text-gray-300 hover:text-red-500 p-2 -mr-2"><Trash2 size={16} /></button>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const InventoryView = ({ inventory, setInventory, onPriceUpdate }) => {
+            const [searchTerm, setSearchTerm] = useState('');
+            const filteredItems = inventory.filter(item => {
+                const searchLower = searchTerm.toLowerCase();
+                return item.name.toLowerCase().includes(searchLower) || (item.aliases && item.aliases.toLowerCase().includes(searchLower));
+            }).sort((a, b) => a.name.localeCompare(b.name));
+            const handleUpdateLocal = (id, field, value) => setInventory(prev => prev.map(item => item.id === id ? { ...item, [field]: value } : item));
+            const handleDeleteItem = (id) => setInventory(prev => prev.filter(item => item.id !== id));
+
+            return (
+                <div className="animate-in fade-in duration-300 pb-20">
+                    <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-4 sticky top-0 z-10">
+                        <div className="relative">
+                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                            <input type="text" placeholder="搜尋花材..." className="w-full pl-10 pr-4 py-2 bg-gray-50 rounded-lg border-none focus:ring-2 focus:ring-emerald-500 outline-none" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
+                        </div>
+                    </div>
+                    <div className="space-y-3">
+                        {filteredItems.map((item) => (
+                            <div key={item.id} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 space-y-3 group hover:border-emerald-200 transition-colors">
+                                <div className="flex justify-between items-start">
+                                    <div className="flex-1"><input type="text" value={item.name} onChange={(e) => handleUpdateLocal(item.id, 'name', e.target.value)} className="font-bold text-gray-800 text-lg border-b border-transparent focus:border-emerald-500 outline-none w-full" placeholder="花材名稱" /></div>
+                                    <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-1 bg-gray-50 px-3 py-1 rounded-lg border border-gray-200 focus-within:border-emerald-500 focus-within:ring-1 focus-within:ring-emerald-500">
+                                            <span className="text-gray-400 text-sm">$</span>
+                                            <input type="number" defaultValue={item.price} onBlur={(e) => { const val = parseFloat(e.target.value); if (val !== item.price) onPriceUpdate(item.id, val); }} className="w-16 bg-transparent outline-none text-right font-bold text-gray-700" />
+                                        </div>
+                                        <button onClick={() => handleDeleteItem(item.id)} className="text-gray-300 hover:text-red-500 p-2"><Trash2 size={18} /></button>
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-2 text-sm text-gray-500 bg-gray-50 p-2 rounded-lg"><Tag size={14} className="shrink-0 text-gray-400" /><input type="text" value={item.aliases || ''} onChange={(e) => handleUpdateLocal(item.id, 'aliases', e.target.value)} placeholder="別名 (例如: 電信, 電信葉)" className="w-full bg-transparent outline-none placeholder-gray-400" /></div>
+                            </div>
+                        ))}
+                    </div>
+                    <p className="text-center text-xs text-gray-400 mt-4">* 修改價格後，系統會自動同步更新所有歷史帳單。</p>
+                </div>
+            );
+        };
+
+        const UploadView = ({ inventory, onCancel, onParsed, userApiKey }) => {
+            const [textInput, setTextInput] = useState('');
+            const [mode, setMode] = useState('text'); 
+            const [imageSrc, setImageSrc] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const fileInputRef = useRef(null);
+
+            const fillLineSample = () => {
+                setTextInput(`森林\n\n幫我把葉材送佳芳家搭便車喔\n\n-葉材-\n茶花葉1大把\n黃藍柏 3小把\n黃金百合竹 2把\n娃娃竹 2把\n紅邊白竹2把\n紫檀或黃揚木 3小把\n木麻黃2小把\n波浪火鶴葉 大1 小1\n謝謝`);
+            };
+            
+            const handleGeminiCall = async (isImage = false) => {
+                if (!userApiKey) {
+                    alert("請先點擊首頁右上角齒輪，設定您的 Gemini API Key 才能使用 AI 功能！");
+                    return;
+                }
+
+                setLoading(true);
+                try {
+                    const result = await callGeminiAPI(
+                        userApiKey,
+                        GEMINI_SYSTEM_PROMPT + (isImage ? "\n\n[Image Input Mode]" : `\n\n[Text Input]:\n${textInput}`),
+                        isImage ? imageSrc : null
+                    );
+                    onParsed(result, isImage ? "(Gemini AI Image Scan)" : textInput);
+                } catch (error) {
+                    alert("AI 辨識失敗: " + error.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleFileChange = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => setImageSrc(e.target.result);
+                    reader.readAsDataURL(file);
+                }
+            };
+
+            return (
+                <div className="bg-white rounded-xl shadow-lg min-h-[85vh] flex flex-col overflow-hidden animate-in slide-in-from-bottom-4 duration-300">
+                    <div className="p-4 border-b flex items-center gap-2 bg-gray-50">
+                        <button onClick={onCancel} className="p-2 hover:bg-gray-200 rounded-full"><ArrowLeft size={20} /></button>
+                        <h2 className="font-bold text-lg">新增帳單 (AI)</h2>
+                    </div>
+                    <div className="flex border-b">
+                        <button onClick={() => setMode('image')} className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 ${mode === 'image' ? 'text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50' : 'text-gray-500'}`}><ScanLine size={16} /> 照片辨識 ✨</button>
+                        <button onClick={() => setMode('text')} className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 ${mode === 'text' ? 'text-emerald-600 border-b-2 border-emerald-600 bg-emerald-50' : 'text-gray-500'}`}><Type size={16} /> 文字貼上 ✨</button>
+                    </div>
+                    <div className="flex-1 p-6 flex flex-col items-center justify-center gap-6 overflow-y-auto">
+                        
+                        {!userApiKey && (
+                            <div className="w-full bg-amber-50 border border-amber-100 p-3 rounded-lg text-xs text-amber-800 flex gap-2 items-start">
+                                <AlertCircle size={16} className="shrink-0 mt-0.5" />
+                                <p>提示：如果您已部署此網頁，請點擊首頁右上角齒輪設定您的 API Key，否則 AI 功能可能無法使用。</p>
+                            </div>
+                        )}
+
+                        {mode === 'text' && (
+                            <div className="w-full h-full flex flex-col gap-4">
+                                <textarea className="flex-1 w-full border border-gray-200 rounded-xl p-4 text-base focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 outline-none resize-none font-mono" placeholder="請貼上 LINE 訂單文字..." value={textInput} onChange={(e) => setTextInput(e.target.value)} />
+                                <div className="flex gap-2">
+                                    <button onClick={fillLineSample} className="px-4 py-2 text-emerald-600 bg-emerald-50 rounded-lg text-sm font-bold">載入範例</button>
+                                    <button 
+                                        onClick={() => handleGeminiCall(false)} 
+                                        disabled={!textInput.trim() || loading} 
+                                        className="flex-1 bg-gradient-to-r from-indigo-600 to-purple-600 text-white py-3 rounded-xl font-bold shadow hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                    >
+                                        {loading ? <Loader2 className="animate-spin" /> : <><Sparkles size={18} /> AI 智慧解析</>}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {mode === 'image' && (
+                            !imageSrc ? (
+                                <div onClick={() => fileInputRef.current.click()} className="w-full aspect-[4/3] border-2 border-dashed border-emerald-200 rounded-2xl flex flex-col items-center justify-center text-emerald-400 cursor-pointer hover:bg-emerald-50 transition-colors group">
+                                    <ScanLine size={48} className="mb-3 group-hover:scale-110 transition-transform" />
+                                    <p className="font-medium">點擊拍攝手寫單據</p>
+                                    <p className="text-xs text-emerald-300 mt-1">Gemini AI Vision</p>
+                                    <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                                </div>
+                            ) : (
+                                <div className="w-full flex flex-col gap-4">
+                                    <img src={imageSrc} alt="Preview" className="w-full max-h-[40vh] object-contain rounded bg-black/5" />
+                                    <div className="flex gap-2">
+                                        <button onClick={() => setImageSrc(null)} className="flex-1 py-2 border rounded text-gray-600">重選</button>
+                                        <button 
+                                            onClick={() => handleGeminiCall(true)} 
+                                            disabled={loading}
+                                            className="flex-[2] bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded font-bold shadow flex items-center justify-center gap-2"
+                                        >
+                                            {loading ? <Loader2 className="animate-spin" /> : <><Sparkles size={18} /> AI 視覺辨識</>}
+                                        </button>
+                                    </div>
+                                </div>
+                            )
+                        )}
+
+                    </div>
+                </div>
+            );
+        };
+
+        const EditView = ({ initialData, inventory, onSave, onCancel }) => {
+            const [formData, setFormData] = useState(initialData);
+            useEffect(() => {
+                const sum = formData.items.reduce((acc, item) => acc + (parseFloat(item.amount) || 0), 0);
+                const currentTotal = parseFloat(formData.totalAmount) || 0;
+                if (Math.abs(sum - currentTotal) > 0.01) setFormData(p => ({ ...p, totalAmount: sum }));
+            }, [formData.items]);
+
+            const handleItemChange = (id, field, value) => {
+                setFormData(prev => ({
+                    ...prev,
+                    items: prev.items.map(item => {
+                        if (item.id === id) {
+                            const updated = { ...item, [field]: value };
+                            if (field === 'name') {
+                                const foundPrice = (value) => { 
+                                    if (!value) return 0;
+                                    const cleanQuery = value.trim().toLowerCase();
+                                    const found = inventory.find(item => {
+                                        if (item.name.toLowerCase() === cleanQuery) return true;
+                                        if (item.aliases) {
+                                            const aliasArray = Array.isArray(item.aliases) ? item.aliases : item.aliases.split(/[,，]/);
+                                            return aliasArray.some(alias => alias.trim().toLowerCase() === cleanQuery);
+                                        }
+                                        return false;
+                                    });
+                                    return found ? found.price : 0;
+                                };
+                                const p = foundPrice(value);
+                                if (p > 0 && (parseFloat(updated.unitPrice) === 0 || updated.unitPrice === '')) updated.unitPrice = p;
+                            }
+                            if (['quantity', 'unitPrice'].includes(field) || (field === 'name' && updated.unitPrice > 0)) {
+                                const q = parseFloat(updated.quantity) || 0;
+                                const p = parseFloat(updated.unitPrice) || 0;
+                                updated.amount = (q > 0 && p > 0) ? q * p : 0;
+                            }
+                            return updated;
+                        }
+                        return item;
+                    })
+                }));
+            };
+
+            const handleAmountChange = (id, value) => {
+                setFormData(prev => ({
+                    ...prev,
+                    items: prev.items.map(item => {
+                        if (item.id === id) {
+                            const amount = parseFloat(value) || 0;
+                            const q = parseFloat(item.quantity) || 0;
+                            if (amount > 0 && q > 0) return { ...item, amount: amount, unitPrice: amount / q };
+                            return { ...item, amount: amount };
+                        }
+                        return item;
+                    })
+                }));
+            };
+
+            const addItem = () => setFormData(prev => ({ ...prev, items: [...prev.items, { id: generateId(), name: '', quantity: 1, unitPrice: 0, amount: 0, unit: '把', note: '' }] }));
+
+            return (
+                <div className="bg-white min-h-screen pb-20 animate-in slide-in-from-right-4 duration-300">
+                    <div className="sticky top-0 bg-white border-b p-4 flex items-center justify-between z-10 shadow-sm">
+                        <button onClick={onCancel} className="text-gray-500 px-2 hover:text-emerald-600">取消</button>
+                        <h2 className="font-bold text-lg">編輯明細</h2>
+                        <button onClick={() => onSave(formData)} className="text-emerald-600 font-bold px-2 flex items-center gap-1 hover:text-emerald-800"><Save size={18} /> 儲存</button>
+                    </div>
+                    <div className="p-4 space-y-6 max-w-md mx-auto">
+                        <div className="bg-yellow-50 p-3 rounded-xl border border-yellow-100">
+                            <div className="flex items-center gap-2 text-yellow-700 mb-1"><StickyNote size={16} /><span className="text-xs font-bold">備註 / 訂單留言</span></div>
+                            <textarea value={formData.notes || ''} onChange={e => setFormData({...formData, notes: e.target.value})} className="w-full bg-transparent text-sm text-gray-700 outline-none resize-none" rows={3} placeholder="例如：幫我送佳芳家..." />
+                        </div>
+                        <div className="bg-gray-50 p-4 rounded-xl border border-gray-100 space-y-4">
+                            <div className="flex items-center gap-3"><User size={18} className="text-gray-400 shrink-0" /><div className="flex-1"><label className="text-xs text-gray-500 block">客戶名稱</label><input type="text" value={formData.customerName} onChange={e => setFormData({...formData, customerName: e.target.value})} placeholder="例如: 嘉義花仙子" className="w-full bg-transparent border-b border-gray-300 focus:border-emerald-500 outline-none py-1 font-medium" /></div></div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="flex items-center gap-3"><Calendar size={18} className="text-gray-400 shrink-0" /><div><label className="text-xs text-gray-500 block">帳單日期</label><input type="date" value={formData.date} onChange={e => setFormData({...formData, date: e.target.value})} className="bg-transparent border-b border-gray-300 focus:border-emerald-500 outline-none py-1 text-sm" /></div></div>
+                                <div className="flex items-center gap-3"><Truck size={18} className="text-gray-400 shrink-0" /><div><label className="text-xs text-gray-500 block">寄送日期</label><input type="date" value={formData.deliveryDate} onChange={e => setFormData({...formData, deliveryDate: e.target.value})} className="w-full bg-transparent border-b border-gray-300 focus:border-emerald-500 outline-none py-1 text-sm" /></div></div>
+                            </div>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-gray-800 mb-3 px-1">品項明細</h3>
+                            <div className="flex items-center gap-2 px-3 mb-1">
+                                <div className="flex-1 grid grid-cols-[3fr_1fr_1.5fr_1.5fr] gap-2 text-xs text-gray-500 text-center font-medium">
+                                    <span className="text-left pl-1">品名</span>
+                                    <span>數量</span>
+                                    <span>單價</span>
+                                    <span>小計</span>
+                                </div>
+                                <div className="w-7"></div>
+                            </div>
+                            <div className="space-y-3">
+                                {formData.items.map((item) => (
+                                    <div key={item.id} className="bg-white rounded-lg border border-gray-100 p-2 space-y-2 shadow-sm hover:border-emerald-200 transition-colors">
+                                        <div className="flex items-center gap-2 group">
+                                            <div className="flex-1 grid grid-cols-[3fr_1fr_1.5fr_1.5fr] gap-2 items-center">
+                                                <div className="relative"><input type="text" list="flower-options" value={item.name} onChange={e => handleItemChange(item.id, 'name', e.target.value)} className="w-full p-2 bg-gray-50 rounded border border-gray-100 focus:bg-white focus:border-emerald-300 outline-none text-sm font-medium" placeholder="品項" /></div>
+                                                <input type="number" value={item.quantity} onChange={e => handleItemChange(item.id, 'quantity', e.target.value)} className="w-full p-2 bg-gray-50 rounded border border-gray-100 focus:bg-white focus:border-emerald-300 outline-none text-center text-sm" placeholder="0" />
+                                                <input type="number" value={item.unitPrice} onChange={e => handleItemChange(item.id, 'unitPrice', e.target.value)} className={`w-full p-2 rounded border border-gray-100 focus:bg-white focus:border-emerald-300 outline-none text-center text-sm ${item.unitPrice > 0 ? 'bg-emerald-50 text-emerald-700 font-medium' : 'bg-gray-50'}`} placeholder="0" />
+                                                <input type="number" value={item.amount} onChange={e => handleAmountChange(item.id, e.target.value)} className="w-full p-2 bg-emerald-100 rounded border border-emerald-200 text-emerald-700 font-bold text-center outline-none text-sm" placeholder="0" />
+                                            </div>
+                                            <button onClick={() => setFormData(p => ({...p, items: p.items.filter(i => i.id !== item.id)}))} className="text-gray-300 hover:text-red-500 p-1"><Trash2 size={18} /></button>
+                                        </div>
+                                        <input type="text" value={item.note || ''} onChange={e => handleItemChange(item.id, 'note', e.target.value)} className="w-full text-xs text-gray-400 bg-gray-50 px-2 py-1 rounded border-none outline-none placeholder-gray-300" placeholder="規格/備註 (如: 大1 小1)" />
+                                    </div>
+                                ))}
+                                <datalist id="flower-options">{inventory.map(inv => (<option key={inv.id} value={inv.name} />))}</datalist>
+                                <button onClick={addItem} className="w-full py-3 border-2 border-dashed border-gray-200 rounded-xl text-gray-400 font-medium hover:border-emerald-300 hover:text-emerald-500 flex items-center justify-center gap-2 transition-colors"><Plus size={18} /> 新增品項</button>
+                            </div>
+                        </div>
+                        <div className="border-t pt-4 pb-8">
+                            <div className="flex justify-between items-center px-2"><span className="text-lg font-bold text-gray-700">總金額 (Total)</span><div className="flex items-center gap-1"><span className="text-gray-400 font-bold text-lg">$</span><input type="number" value={formData.totalAmount} onChange={e => setFormData({...formData, totalAmount: parseFloat(e.target.value) || 0})} className="text-3xl font-bold text-right w-40 border-b-2 border-transparent focus:border-emerald-500 outline-none bg-transparent text-emerald-600 placeholder-emerald-200" placeholder="0" /></div></div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
